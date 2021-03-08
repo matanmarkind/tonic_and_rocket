@@ -1,0 +1,48 @@
+syntax = "proto3";
+package routeguide;
+
+// Points are represented as latitue-longitude pairs in the E7 representation
+// (degrees multiplied by 1e7 and rounded to the nearest integer). Latitudes
+// should be in the range +/- 90 degrees and longitude should be in the range
+// +/- 180 degrees (inclusive).
+message Point {
+    int32 latitude = 1;
+    int32 longitude = 2;
+}
+
+// A latitude-longitude rectangle, represented as 2 diagonally opposide points.
+message Rectangle {
+    Point low = 1;
+    Point high = 2;
+}
+
+// A feature names somthing at a given point.
+message Feature {
+    // Note that it is possible for features to be unnamed.
+    string name = 1;
+    Point location = 2;
+}
+
+// A message that is attached to a specific location.
+message RouteNote {
+    Point location = 1;
+    string message = 2;
+}
+
+// Summary of a route once recording is completed.
+message RouteSummary {
+    // The number of points received for recording.
+    int32 point_count = 1;
+
+    // The number of features passed while traversing the route.
+    int32 feature_count = 2;
+
+    // The distance covered in meters.
+    //
+    // TODO: Amount of distance between the beginning and end points or the
+    // amount of distance traversed over the entire path?
+    int32 distance = 3;
+
+    // Duration of the travel in seconds.
+    int32 elapsed_time_seconds = 4;
+}

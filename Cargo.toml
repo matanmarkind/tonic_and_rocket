@@ -1,0 +1,43 @@
+[package]
+name = "routeguide-tonic"
+version = "0.1.0"
+authors = ["Matan Markind <matan.markind@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+[[bin]]
+name = "route_programmer"
+path = "src/route_programmer.rs"
+
+[[bin]]
+name = "route_user"
+path = "src/route_user.rs"
+
+[[bin]]
+name = "web_user"
+path = "src/web_user.rs"
+
+[dependencies]
+tonic = "0.4"
+prost = "0.7"
+futures = "0.3"
+tokio = {version = "1.1.0", features = ["full"]}
+tokio-stream = "0.1.2"
+active_standby = "0.4.0"
+crossbeam = "0.8.0"
+
+async-stream = "0.3"
+serde = {version = "1.0", features = ["derive"]}
+serde_json = "1.0"
+rand = "0.8"
+
+rocket = { path = "Rocket/core/lib"}
+rocket_contrib = { path = "Rocket/contrib/lib"}
+
+[build-dependencies]
+tonic-build = "0.4"

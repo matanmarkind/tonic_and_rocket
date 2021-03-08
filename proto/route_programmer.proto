@@ -1,0 +1,22 @@
+syntax = "proto3";
+package routeguide;
+import "types.proto";
+
+service ProgramRoute {
+    // Adds a new feature at the given location.
+    rpc AddFeature(Feature) returns (Status) {}
+}
+
+message Status {
+    enum Code {
+        OK = 0;
+        INVALID_INPUT = 1;
+        INTERNAL_ERROR = 2;
+        // Leave 2-99 open for other more descriptive codes.
+        GENERIC_ERROR = 100;
+    }
+    Code status = 1;
+
+    // Only present of status is not OK.
+    string error_message = 2;
+}
