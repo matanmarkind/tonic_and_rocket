@@ -171,11 +171,16 @@ async fn create_route_guide_client(socket: &'static str) -> RouteGuideClient<Cha
     panic!("Unable to connect to backend servers.");
 }
 
+/// In order to run the web server we need to run 3 processes:
+/// - cargo run --bin server # run the backend server
+/// - cargo run --bin route_programmer # update the backend server
+/// - cargo run --bin web_user # run the rocket frontend
 #[rocket::launch]
 async fn rocket() -> rocket::Rocket {
     // Connect to all of the dependency servers in parallel.
     let route_guide_client_handle =
         tokio::spawn(async { create_route_guide_client("http://[::1]:10000").await });
+
     rocket::ignite()
         .manage(route_guide_client_handle.await.unwrap())
         .manage(Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new()))

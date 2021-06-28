@@ -35,12 +35,10 @@ struct RouteGuideService {
     // responses. This allows for each request to be handled in a wait free
     // manner by each worker. If a given worker is busy we will wait until it is
     // free to send it the request.
-    pipelines: Vec<
-        std::sync::Mutex<(
-            channel::Sender<RouteGuideServiceRequest>,
-            channel::Receiver<RouteGuideServiceResponse>,
-        )>,
-    >,
+    pipelines: Vec<(
+        channel::Sender<RouteGuideServiceRequest>,
+        channel::Receiver<RouteGuideServiceResponse>,
+    )>,
 
     // Used to clone handles to Feature for streaming APIs.
     features: std::sync::Mutex<asvec::AsLockHandle<Feature>>,
@@ -97,13 +95,15 @@ impl RouteGuide for RouteGuideService {
 
         let index = self
             .worker_index
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let guard = &self.pipelines[index].lock().unwrap();
-        guard
-            .0
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            % self.pipelines.len();
+        let (sender, receiver) = &self.pipelines[index];
+
+        // This will block until this worker thread is free.
+        sender
             .send(RouteGuideServiceRequest::GetFeature(request.into_inner()))
             .unwrap();
-        match guard.1.recv().unwrap() {
+        match receiver.recv().unwrap() {
             RouteGuideServiceResponse::GetFeature(res) => res,
         }
     }
@@ -250,6 +250,10 @@ fn calc_distance(p1: &Point, p2: &Point) -> i32 {
     (R * c) as i32
 }
 
+/// In order to run and check the server we need to run 3 processes:
+/// - cargo run --bin server # run the backend server
+/// - cargo run --bin route_programmer # update the backend server
+/// - cargo run --bin web_user/route_user # run the client (web or plain)
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The state used to generate responses.
@@ -259,9 +263,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pipelines: Vec<_> = vec![];
     let mut worker_handles: Vec<_> = vec![];
     for _ in 0..NUM_WORKERS {
-        let (tx_request, rx_request) = channel::unbounded();
-        let (tx_response, rx_response) = channel::unbounded();
-        pipelines.push(std::sync::Mutex::new((tx_request, rx_response)));
+        // We rely on creating channels with capacity 0 to synchronize the
+        // request and response. If there was a capacity it would be possible
+        // for 2 tasks to send their requests to the same worker and then
+        // receive the responses of each other. By placing 0 capacity on both,
+        // we guarantee that the order is functionally equivalent to:
+        // 1. task_a sends request1.
+        // 2. worker receives request1.
+        // 3. task_b sends request2 and waits for it to be received by worker.
+        // 4. task_a awaits receival of response1.
+        // 5. worker sends response1.
+        // 6. task_a receives response1 which only task_a is waiting to receive.
+        let (tx_request, rx_request) = channel::bounded(0);
+        let (tx_response, rx_response) = channel::bounded(0);
+        pipelines.push((tx_request, rx_response));
 
         let worker = RouteGuideWorker {
             receiver: rx_request,
