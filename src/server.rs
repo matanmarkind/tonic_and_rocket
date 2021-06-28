@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Instant;
 
-use active_standby::collections::vec as evvec;
+use active_standby::collections::vec as asvec;
 use crossbeam::channel;
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
@@ -16,20 +16,62 @@ use routeguide::program_route_server::{ProgramRoute, ProgramRouteServer};
 use routeguide::route_guide_server::{RouteGuide, RouteGuideServer};
 use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
+const NUM_WORKERS: i32 = 4;
+
+enum RouteGuideServiceRequest {
+    // We only handle non streaming APIs here. All of the streaming APIs need to
+    // get their own handle to Feature and so don't work with passing off to the
+    // worker pool.
+    GetFeature(Point),
+}
+
+enum RouteGuideServiceResponse {
+    GetFeature(Result<Response<Feature>, Status>),
+}
+
+// TODO: Add balancing across pipelines.
 struct RouteGuideService {
-    features: evvec::Reader<Feature>,
+    // Used in non-streaming APIs so send requests tot he worker pool and get
+    // responses. This allows for each request to be handled in a wait free
+    // manner by each worker. If a given worker is busy we will wait until it is
+    // free to send it the request.
+    pipelines: Vec<
+        std::sync::Mutex<(
+            channel::Sender<RouteGuideServiceRequest>,
+            channel::Receiver<RouteGuideServiceResponse>,
+        )>,
+    >,
+
+    // Used to clone handles to Feature for streaming APIs.
+    features: std::sync::Mutex<asvec::AsLockHandle<Feature>>,
+
+    // Used to send to the workers in a round robin to load balance.
+    worker_index: std::sync::atomic::AtomicUsize,
+}
+
+struct RouteGuideWorker {
+    receiver: channel::Receiver<RouteGuideServiceRequest>,
+    sender: channel::Sender<RouteGuideServiceResponse>,
+    features: asvec::AsLockHandle<Feature>,
+}
+
+impl RouteGuideWorker {
+    pub fn get_feature(&self, point: Point) -> Result<Response<Feature>, Status> {
+        for feature in &self.features.read()[..] {
+            if feature.location.as_ref() == Some(&point) {
+                return Ok(Response::new(feature.clone()));
+            }
+        }
+        Ok(Response::new(Feature::default()))
+    }
 }
 
 struct ProgramRouteService {
     features_sender: channel::Sender<Feature>,
 }
 
-// // By locking Writer behind a Mutex it should be thread safe...
-// unsafe impl Send for ProgramRouteService {}
-// unsafe impl Sync for ProgramRouteService {}
-// evvec::Writer<Feature>
-
 type StreamResponse<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + Sync + 'static>>;
+type ListFeaturesStream = StreamResponse<Feature>;
 
 #[tonic::async_trait]
 impl ProgramRoute for ProgramRouteService {
@@ -52,28 +94,37 @@ impl ProgramRoute for ProgramRouteService {
 impl RouteGuide for RouteGuideService {
     async fn get_feature(&self, request: Request<Point>) -> Result<Response<Feature>, Status> {
         println!("GetFeature = {:?}", request);
-        for feature in &self.features.read()[..] {
-            if feature.location.as_ref() == Some(request.get_ref()) {
-                return Ok(Response::new(feature.clone()));
-            }
+
+        let index = self
+            .worker_index
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = &self.pipelines[index].lock().unwrap();
+        guard
+            .0
+            .send(RouteGuideServiceRequest::GetFeature(request.into_inner()))
+            .unwrap();
+        match guard.1.recv().unwrap() {
+            RouteGuideServiceResponse::GetFeature(res) => res,
         }
-        return Ok(Response::new(Feature::default()));
     }
 
-    type ListFeaturesStream = StreamResponse<Feature>;
-
+    type ListFeaturesStream = ListFeaturesStream;
     async fn list_features(
         &self,
         request: Request<Rectangle>,
     ) -> Result<Response<Self::ListFeaturesStream>, Status> {
         println!("ListFeatures = {:?}", request);
 
+        // Create a handle to read features which can be sent to the streaming
+        // task.
+        let features = self.features.lock().unwrap().clone();
         let (tx, rx) = mpsc::channel(4);
-        let features = self.features.read().clone();
+        let rectangle = request.into_inner();
 
         tokio::spawn(async move {
+            let features = features.read();
             for feature in &features[..] {
-                if in_range(feature.location.as_ref().unwrap(), request.get_ref()) {
+                if in_range(feature.location.as_ref().unwrap(), &rectangle) {
                     println!("  => send {:?}", feature);
                     tx.send(Ok(feature.clone())).await.unwrap();
                 }
@@ -91,8 +142,11 @@ impl RouteGuide for RouteGuideService {
     ) -> Result<Response<RouteSummary>, Status> {
         println!("record_route");
 
-        let mut stream = request.into_inner();
+        // Create a handle to read features which can be sent to the streaming
+        // task.
+        let features = self.features.lock().unwrap().clone();
 
+        let mut stream = request.into_inner();
         let mut summary = RouteSummary::default();
         let mut last_point = None;
         let now = Instant::now();
@@ -105,7 +159,8 @@ impl RouteGuide for RouteGuideService {
 
             summary.point_count += 1;
 
-            for feature in &self.features.read()[..] {
+            let features = features.read();
+            for feature in &features[..] {
                 if feature.location.as_ref() == Some(&point) {
                     summary.feature_count += 1;
                 }
@@ -197,20 +252,51 @@ fn calc_distance(p1: &Point, p2: &Point) -> i32 {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (sender, receiver) = channel::unbounded();
+    // The state used to generate responses.
+    let features = asvec::AsLockHandle::<Feature>::default();
 
-    let mut features_writer = evvec::Writer::<Feature>::new();
+    // Create worker threads to handle requests.
+    let mut pipelines: Vec<_> = vec![];
+    let mut worker_handles: Vec<_> = vec![];
+    for _ in 0..NUM_WORKERS {
+        let (tx_request, rx_request) = channel::unbounded();
+        let (tx_response, rx_response) = channel::unbounded();
+        pipelines.push(std::sync::Mutex::new((tx_request, rx_response)));
 
+        let worker = RouteGuideWorker {
+            receiver: rx_request,
+            sender: tx_response,
+            features: features.clone(),
+        };
+
+        worker_handles.push(std::thread::spawn(move || {
+            while let Ok(req) = worker.receiver.recv() {
+                let res = match req {
+                    RouteGuideServiceRequest::GetFeature(point) => {
+                        RouteGuideServiceResponse::GetFeature(worker.get_feature(point))
+                    }
+                };
+                worker.sender.send(res).unwrap();
+            }
+        }));
+    }
+
+    // Create the server front end which takes in requests, pipes them to the
+    // worker pool and gives the responses.
     let route_guide = RouteGuideServer::new(RouteGuideService {
-        features: features_writer.new_reader(),
+        pipelines,
+        features: std::sync::Mutex::new(features.clone()),
+        worker_index: std::sync::atomic::AtomicUsize::new(0),
     });
+
+    // Handle updates to the server's state.
+    let (sender, receiver) = channel::unbounded();
     let route_programmer = ProgramRouteServer::new(ProgramRouteService {
         features_sender: sender,
     });
-
     let writer_handle = std::thread::spawn(move || {
         for feature in receiver {
-            features_writer.write().push(feature);
+            features.write().push(feature);
         }
     });
 
@@ -221,5 +307,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     writer_handle.join().expect("writer_handle failed");
+    for wh in worker_handles {
+        wh.join().expect("worker_handle failed");
+    }
+
     Ok(())
 }

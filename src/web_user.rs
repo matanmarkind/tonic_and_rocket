@@ -150,7 +150,7 @@ async fn list_features(
                 .await
             {
                 Ok(()) => (),
-                Err(e) => panic!(e),
+                Err(e) => std::panic::panic_any(e),
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -186,5 +186,9 @@ async fn rocket() -> rocket::Rocket {
         .mount(
             "/static",
             StaticFiles::from(crate_relative!("data/static_webpages")),
+        )
+        .mount(
+            "/add",
+            StaticFiles::from(crate_relative!("data/static_webpages/add_wasm")),
         )
 }
