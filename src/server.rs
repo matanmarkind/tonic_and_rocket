@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use active_standby::collections::vec as asvec;
-use crossbeam::channel;
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tonic::transport::Server;
@@ -31,13 +30,23 @@ enum RouteGuideServiceResponse {
 
 // TODO: Add balancing across pipelines.
 struct RouteGuideService {
-    // Used in non-streaming APIs so send requests tot he worker pool and get
+    // Used in non-streaming APIs so send requests to the worker pool and get
     // responses. This allows for each request to be handled in a wait free
     // manner by each worker. If a given worker is busy we will wait until it is
     // free to send it the request.
     pipelines: Vec<(
-        channel::Sender<RouteGuideServiceRequest>,
-        channel::Receiver<RouteGuideServiceResponse>,
+        // This is async because we may have to await some unknown number of
+        // other tasks being handled by the worker pool. Not sure if this sender
+        // is fair. It is based on crossbeam's channel which uses
+        // parking_lot::Mutex, which is eventually fair
+        // (https://github.com/crossbeam-rs/crossbeam-channel/blob/master/src/flavors/zero.rs).
+        // It seems that we also rely on the runtime's fairness, which I have
+        // little understanding of
+        // (https://www.reddit.com/r/rust/comments/hi9vhj/crossfire_yet_another_async_mpmcmpsc_based_on/fwg5ou4/).
+        crossfire::mpsc::TxFuture<RouteGuideServiceRequest, crossfire::mpsc::SharedSenderFRecvB>,
+        // This is blocking because once the pool is actually working on the
+        // request we want to minimize latency on sending the response.
+        crossbeam::channel::Receiver<RouteGuideServiceResponse>,
     )>,
 
     // Used to clone handles to Feature for streaming APIs.
@@ -48,8 +57,9 @@ struct RouteGuideService {
 }
 
 struct RouteGuideWorker {
-    receiver: channel::Receiver<RouteGuideServiceRequest>,
-    sender: channel::Sender<RouteGuideServiceResponse>,
+    receiver:
+        crossfire::mpsc::RxBlocking<RouteGuideServiceRequest, crossfire::mpsc::SharedSenderFRecvB>,
+    sender: crossbeam::channel::Sender<RouteGuideServiceResponse>,
     features: asvec::AsLockHandle<Feature>,
 }
 
@@ -65,7 +75,7 @@ impl RouteGuideWorker {
 }
 
 struct ProgramRouteService {
-    features_sender: channel::Sender<Feature>,
+    features_sender: crossbeam::channel::Sender<Feature>,
 }
 
 type StreamResponse<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + Sync + 'static>>;
@@ -99,10 +109,13 @@ impl RouteGuide for RouteGuideService {
             % self.pipelines.len();
         let (sender, receiver) = &self.pipelines[index];
 
-        // This will block until this worker thread is free.
+        // This will await until this worker thread is free.
         sender
             .send(RouteGuideServiceRequest::GetFeature(request.into_inner()))
+            .await
             .unwrap();
+
+        // This will block until the response has been received.
         match receiver.recv().unwrap() {
             RouteGuideServiceResponse::GetFeature(res) => res,
         }
@@ -274,8 +287,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 4. task_a awaits receival of response1.
         // 5. worker sends response1.
         // 6. task_a receives response1 which only task_a is waiting to receive.
-        let (tx_request, rx_request) = channel::bounded(0);
-        let (tx_response, rx_response) = channel::bounded(0);
+        let (tx_request, rx_request) = crossfire::mpsc::bounded_tx_future_rx_blocking(0);
+        let (tx_response, rx_response) = crossbeam::channel::bounded(0);
         pipelines.push((tx_request, rx_response));
 
         let worker = RouteGuideWorker {
@@ -305,7 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Handle updates to the server's state.
-    let (sender, receiver) = channel::unbounded();
+    let (sender, receiver) = crossbeam::channel::unbounded();
     let route_programmer = ProgramRouteServer::new(ProgramRouteService {
         features_sender: sender,
     });
