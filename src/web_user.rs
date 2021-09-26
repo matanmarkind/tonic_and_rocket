@@ -138,6 +138,10 @@ async fn list_features(
         .unwrap()
         .into_inner();
 
+    // Create a Stream result by creating a TCP connection and returning the RX
+    // side, while spawning a task for the TX side. Probably better to follow
+    // list_features2 and impl AsyncRead for the return type.
+
     // Port 0 tells to operating system to choose an unused port.
     let tcp_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let socket_addr = tcp_listener.local_addr().unwrap();

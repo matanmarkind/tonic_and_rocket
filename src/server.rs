@@ -15,6 +15,27 @@ use routeguide::program_route_server::{ProgramRoute, ProgramRouteServer};
 use routeguide::route_guide_server::{RouteGuide, RouteGuideServer};
 use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
+// The design of this server is an attempt to tie together a couple things:
+// - tonic - to use GRPC
+// - active_standby - for wait free reads and non-blocking writes
+//
+// In terms of the interface we attempt to allow wait free responses to
+// non-streaming requests, and minimal waiting even to streaming requests. This
+// is done by leveraging the active_standby crate. Even with active_standby, we
+// continue to face a challenge, because active_standby requires passing a
+// handle to each thread/task. Tonic is designed for the user not to need to
+// consider generating X tasks, but at the cost of making the server Sync.
+//
+// In practice we handle streaming and non-streaming requests separately. For
+// non-streaming requests we create a pool of worker threads which each have
+// their own active_standby handle. When such a request comes in, we send it to
+// the pool and wait for a response. Progress is only blocked on the worker
+// threads being busy (CPU bound). For streaming requests, we will need to wait
+// as part of the streaming, and so we are willing to accept a small price. What
+// happens in these cases, is that this request triggers a specific task, so now
+// we can allocate an active_standby handle to that task, and for the duration
+// of its handling, we will have wait-free read access.
+
 const NUM_WORKERS: i32 = 4;
 
 enum RouteGuideServiceRequest {
@@ -35,17 +56,20 @@ struct RouteGuideService {
     // manner by each worker. If a given worker is busy we will wait until it is
     // free to send it the request.
     pipelines: Vec<(
-        // This is async because we may have to await some unknown number of
-        // other tasks being handled by the worker pool. Not sure if this sender
-        // is fair. It is based on crossbeam's channel which uses
-        // parking_lot::Mutex, which is eventually fair
+        // Sending requests to the worker pool is async because we may have to
+        // await some unknown number of other tasks being handled by the worker
+        // pool. Not sure if this sender is fair. It is based on crossbeam's
+        // channel which uses parking_lot::Mutex, which is eventually fair
         // (https://github.com/crossbeam-rs/crossbeam-channel/blob/master/src/flavors/zero.rs).
         // It seems that we also rely on the runtime's fairness, which I have
         // little understanding of
         // (https://www.reddit.com/r/rust/comments/hi9vhj/crossfire_yet_another_async_mpmcmpsc_based_on/fwg5ou4/).
         crossfire::mpsc::TxFuture<RouteGuideServiceRequest, crossfire::mpsc::SharedSenderFRecvB>,
-        // This is blocking because once the pool is actually working on the
-        // request we want to minimize latency on sending the response.
+        // Receiving a response from the worker pool is blocking because once
+        // the pool is actually working on the request we want to minimize
+        // latency on sending the response to the client. This may come at the
+        // cost of throughput since this async task will hang until it receives
+        // the response from the worker pool.
         crossbeam::channel::Receiver<RouteGuideServiceResponse>,
     )>,
 
